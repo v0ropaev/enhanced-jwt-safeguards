@@ -5,9 +5,10 @@ from datetime import timedelta
 
 from app.config import PUBLIC_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_MINUTES
 from app.models import Token, User
-from app.auth import authenticate_user, get_current_user
+from app.auth import authenticate_user, get_current_user, is_token_revoked, is_token_used, mark_token_used, \
+    mark_token_revoked
 from app.security import create_token, get_password_hash
-from app.db import fake_users_db, revoked_tokens, used_refresh_tokens
+from app.db import fake_users_db
 from app.logging_config import logger
 from app.limiter import limiter
 
@@ -37,7 +38,7 @@ def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
 
     access_token = create_token({"sub": user.username}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     refresh_token = create_token({"sub": user.username, "scope": "refresh_token"},
-        timedelta(minutes=REFRESH_TOKEN_EXPIRE_MINUTES))
+                                 timedelta(minutes=REFRESH_TOKEN_EXPIRE_MINUTES))
     logger.info("User logged in: %s", user.username)
     return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
 
@@ -45,6 +46,14 @@ def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
 @router.post("/refresh", response_model=Token)
 @limiter.limit("5/minute")
 def refresh_token(request: Request, token: str = Depends(oauth2_scheme)):
+    if is_token_revoked(token):
+        logger.warning("Attempt to use revoked token for refresh")
+        raise HTTPException(status_code=401, detail="Token has been revoked")
+
+    if is_token_used(token):
+        logger.warning("Attempt to reuse refresh token")
+        raise HTTPException(status_code=401, detail="Token already used")
+
     try:
         header = jwt.get_unverified_header(token)
         if header.get("alg") != ALGORITHM:
@@ -53,10 +62,7 @@ def refresh_token(request: Request, token: str = Depends(oauth2_scheme)):
         payload = jwt.decode(token, PUBLIC_KEY, algorithms=[ALGORITHM])
         if payload.get("scope") != "refresh_token":
             raise HTTPException(status_code=401, detail="Invalid scope for refresh")
-        if token in used_refresh_tokens:
-            raise HTTPException(status_code=401, detail="Token already used")
 
-        used_refresh_tokens.add(token)
         username = payload.get("sub")
         if not username:
             raise HTTPException(status_code=401, detail="Invalid token subject")
@@ -65,17 +71,20 @@ def refresh_token(request: Request, token: str = Depends(oauth2_scheme)):
         logger.error("Refresh token invalid: %s", str(e))
         raise HTTPException(status_code=401, detail="Invalid token")
 
+    mark_token_used(token)
+    logger.info("Token refreshed for user: %s", username)
+
     new_access_token = create_token({"sub": username}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     new_refresh_token = create_token({"sub": username, "scope": "refresh_token"},
-        timedelta(minutes=REFRESH_TOKEN_EXPIRE_MINUTES))
-    logger.info("Token refreshed for user: %s", username)
+                                     timedelta(minutes=REFRESH_TOKEN_EXPIRE_MINUTES))
+
     return {"access_token": new_access_token, "refresh_token": new_refresh_token, "token_type": "bearer"}
 
 
 @router.post("/logout")
 @limiter.limit("5/minute")
 def logout(request: Request, token: str = Depends(oauth2_scheme)):
-    if token in revoked_tokens or token in used_refresh_tokens:
+    if is_token_revoked(token) or is_token_used(token):
         logger.warning("Attempt to reuse a revoked or used token")
         raise HTTPException(status_code=401, detail="Token already used or revoked")
 
@@ -91,8 +100,8 @@ def logout(request: Request, token: str = Depends(oauth2_scheme)):
         logger.error("Invalid token on logout: %s", str(e))
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    revoked_tokens.add(token)
-    used_refresh_tokens.add(token)
+    mark_token_revoked(token)
+    mark_token_used(token)
     logger.info("Token revoked: %s", token)
     return {"msg": "Token revoked"}
 

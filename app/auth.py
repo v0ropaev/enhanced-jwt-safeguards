@@ -1,7 +1,7 @@
 from fastapi import Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
-from app.db import fake_users_db, revoked_tokens
+from app.db import fake_users_db, revoked_tokens, used_refresh_tokens
 from app.models import UserInDB, User
 from app.security import verify_password
 from app.config import PUBLIC_KEY, ALGORITHM
@@ -24,8 +24,24 @@ def authenticate_user(username: str, password: str):
     return user
 
 
+def is_token_revoked(token: str) -> bool:
+    return token in revoked_tokens
+
+
+def is_token_used(token: str) -> bool:
+    return token in used_refresh_tokens
+
+
+def mark_token_revoked(token: str):
+    revoked_tokens.add(token)
+
+
+def mark_token_used(token: str):
+    used_refresh_tokens.add(token)
+
+
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
-    if token in revoked_tokens:
+    if is_token_revoked(token):
         logger.warning("Attempt to use revoked token")
         raise HTTPException(status_code=401, detail="Token revoked")
 
